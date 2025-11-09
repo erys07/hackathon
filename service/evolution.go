@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -41,15 +42,65 @@ func (e *EvolutionClient) SendTextMessage(ctx context.Context, to, message strin
 
 func (e *EvolutionClient) SendAudioMessage(ctx context.Context, to string, audio []byte) error {
 	base64Audio := base64.StdEncoding.EncodeToString(audio)
-
-	payload := map[string]string{
-		"number":  to,
-		"base64":  base64Audio,
-		"mime":    "audio/mpeg",
-		"caption": "Resposta em áudio",
+	sample := base64Audio
+	if len(sample) > 64 {
+		sample = fmt.Sprintf("%s...%s", sample[:32], sample[len(sample)-16:])
 	}
 
-	return e.postJSON(ctx, fmt.Sprintf("%s/message/sendMedia/%s", e.baseURL, e.instance), payload)
+	log.Printf("SendAudioMessage: mediatype=audio to=%s base64_len=%d sample=%s", to, len(base64Audio), sample)
+
+	payloads := []map[string]any{
+		{
+			"number":    to,
+			"mediatype": "audio",
+			"data":      base64Audio,
+		},
+		{
+			"number":    to,
+			"mediatype": "audio",
+			"file":      base64Audio,
+		},
+		{
+			"number":    to,
+			"mediatype": "audio",
+			"media":     base64Audio,
+		},
+		{
+			"number":    to,
+			"mediatype": "audio",
+			"mediaData": map[string]any{
+				"base64": base64Audio,
+			},
+		},
+		{
+			"number": to,
+			"mediaMessage": map[string]any{
+				"mediaType": "audio",
+				"media":     base64Audio,
+			},
+		},
+	}
+
+	for idx, payload := range payloads {
+		payloadJSON, _ := json.Marshal(payload)
+		log.Printf("SendAudioMessage: attempt %d payload keys=%v body=%s", idx+1, mapKeys(payload), truncate(string(payloadJSON), 256))
+
+		err := e.postJSON(ctx, fmt.Sprintf("%s/message/sendMedia/%s", e.baseURL, e.instance), payload)
+		if err == nil {
+			return nil
+		}
+
+		errMsg := err.Error()
+		log.Printf("SendAudioMessage: attempt %d error=%v", idx+1, errMsg)
+
+		if !strings.Contains(strings.ToLower(errMsg), "owned media must be a url or base64") || idx == len(payloads)-1 {
+			return err
+		}
+
+		log.Printf("SendAudioMessage: attempt %d failed with owned media error, trying next payload shape", idx+1)
+	}
+
+	return nil
 }
 
 func (e *EvolutionClient) postJSON(ctx context.Context, url string, body any) error {
@@ -78,4 +129,20 @@ func (e *EvolutionClient) postJSON(ctx context.Context, url string, body any) er
 	}
 
 	return nil
+}
+
+func mapKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+
+	return fmt.Sprintf("%s...%s", s[:max/2], s[len(s)-max/2:])
 }

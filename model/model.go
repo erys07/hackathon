@@ -7,6 +7,9 @@ type Config struct {
 	OpenAIAPIKey      string
 	OpenAIVoice       string
 	OpenAIModel       string
+	RedisAddr         string
+	RedisPassword     string
+	RedisDB           int
 }
 
 type WebhookPayload struct {

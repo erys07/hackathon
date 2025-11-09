@@ -22,8 +22,13 @@ func main() {
 
 	openaiClient := openai.NewClient(cfg.OpenAIAPIKey)
 	evoClient := service.NewEvolutionClient(cfg)
+	conversationStore, err := service.NewConversationStore(cfg)
+	if err != nil {
+		log.Fatalf("redis error: %v", err)
+	}
+	defer conversationStore.Close()
 
-	http.HandleFunc("/webhook", service.WebhookHandler(openaiClient, evoClient, cfg))
+	http.HandleFunc("/webhook", service.WebhookHandler(openaiClient, evoClient, conversationStore, cfg))
 
 	addr := ":8080"
 	log.Printf("server listening on %s", addr)
