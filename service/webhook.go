@@ -1,11 +1,8 @@
 package service
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -17,6 +14,14 @@ import (
 )
 
 func WebhookHandler(oa *openai.Client, evo *EvolutionClient, store *ConversationStore, cfg *model.Config) http.HandlerFunc {
+	if evo == nil {
+		panic("WebhookHandler requires EvolutionClient")
+	}
+
+	if oa == nil {
+		log.Print("WebhookHandler: openai client is nil, responses will be Echo mode")
+	}
+
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -31,66 +36,115 @@ func WebhookHandler(oa *openai.Client, evo *EvolutionClient, store *Conversation
 		}
 		defer r.Body.Close()
 
+		log.Printf("webhook request: method=%s path=%s remote=%s", r.Method, r.URL.Path, r.RemoteAddr)
+		log.Printf("webhook payload raw: %s", string(body))
+
 		var payload model.WebhookPayload
 		if err := json.Unmarshal(body, &payload); err != nil {
 			log.Printf("webhook decode error: %v", err)
-			log.Printf("webhook raw payload: %s", string(body))
 			http.Error(w, "invalid payload", http.StatusBadRequest)
 			return
 		}
 
 		ctx := r.Context()
-		if err := handleIncomingMessage(ctx, oa, evo, store, cfg, payload.Data, string(body)); err != nil {
-			log.Printf("webhook handling error: %v", err)
-			http.Error(w, "failed to process message", http.StatusInternalServerError)
-			return
+
+		switch payload.Event {
+		case "messages.upsert":
+			if err := handleMessagesUpsert(ctx, payload, oa, evo, store, cfg); err != nil {
+				log.Printf("handle messages.upsert error: %v", err)
+			}
+		case "message_create":
+			var data model.WebhookData
+			if err := json.Unmarshal(payload.Data, &data); err != nil {
+				log.Printf("webhook message_create decode error: %v", err)
+				break
+			}
+
+			if err := processWebhookMessage(ctx, oa, evo, store, cfg, payload.Sender, data.Message, data.Key); err != nil {
+				log.Printf("handle message_create error: %v", err)
+			}
+		default:
+			log.Printf("webhook ignoring event: %s", payload.Event)
 		}
 
 		w.WriteHeader(http.StatusOK)
 	}
 }
 
-func handleIncomingMessage(ctx context.Context, oa *openai.Client, evo *EvolutionClient, store *ConversationStore, cfg *model.Config, data model.WebhookData, rawBody string) error {
-	msg := data.Message
-
-	sender := resolveSender(data)
-	if sender == "" {
-		log.Printf("handleIncomingMessage: missing sender id in payload: %s", rawBody)
-		return errors.New("missing sender id")
+func handleMessagesUpsert(ctx context.Context, payload model.WebhookPayload, oa *openai.Client, evo *EvolutionClient, store *ConversationStore, cfg *model.Config) error {
+	var container struct {
+		Messages []model.MessagesUpsertEntry `json:"messages"`
 	}
 
-	if data.Key.FromMe {
-		log.Printf("handleIncomingMessage: ignoring outgoing message from %s", sender)
+	if err := json.Unmarshal(payload.Data, &container); err == nil && len(container.Messages) > 0 {
+		for _, entry := range container.Messages {
+			if entry.Key.FromMe {
+				continue
+			}
+			if err := processWebhookMessage(ctx, oa, evo, store, cfg, payload.Sender, entry.Message, entry.Key); err != nil {
+				log.Printf("process messages.upsert entry error: %v", err)
+			}
+		}
 		return nil
 	}
 
-	userInput := extractMessageBody(msg)
-
-	messageType := strings.ToLower(strings.TrimSpace(msg.Type))
-	if messageType == "" {
-		messageType = strings.ToLower(strings.TrimSpace(data.MessageType))
+	var single model.MessagesUpsertEntry
+	if err := json.Unmarshal(payload.Data, &single); err != nil {
+		return err
 	}
 
-	if messageType == "audio" || messageType == "ptt" {
-		if msg.Audio == nil || msg.Audio.URL == "" {
-			return errors.New("audio message missing url")
-		}
-
-		transcribed, err := transcribeAudio(ctx, oa, msg.Audio.URL)
-		if err != nil {
-			return fmt.Errorf("transcribe audio: %w", err)
-		}
-		userInput = transcribed
+	if single.Key.FromMe {
+		return nil
 	}
 
-	if userInput == "" {
-		return errors.New("empty message content")
+	return processWebhookMessage(ctx, oa, evo, store, cfg, payload.Sender, single.Message, single.Key)
+}
+
+func processWebhookMessage(ctx context.Context, oa *openai.Client, evo *EvolutionClient, store *ConversationStore, cfg *model.Config, sender string, msg model.WebhookMessage, key model.WebhookKey) error {
+	text := extractMessageText(msg)
+	if text == "" {
+		return nil
 	}
 
-	conversation, err := store.GetConversation(ctx, sender)
+	if key.FromMe {
+		return nil
+	}
+
+	recipient := chooseRecipient(key.RemoteJID, msg.From, sender)
+	if recipient == "" {
+		return nil
+	}
+
+	reply, err := generateAssistantReply(ctx, oa, store, cfg, recipient, text)
 	if err != nil {
-		log.Printf("conversation load failed for %s: %v", sender, err)
-		conversation = nil
+		return err
+	}
+
+	if reply == "" {
+		return nil
+	}
+
+	if err := evo.SendTextMessage(ctx, recipient, reply); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func generateAssistantReply(ctx context.Context, oa *openai.Client, store *ConversationStore, cfg *model.Config, recipient string, userInput string) (string, error) {
+	normalizedID := normalizeWhatsAppID(recipient)
+	if normalizedID == "" {
+		return "", nil
+	}
+
+	var conversation []openai.ChatCompletionMessage
+	if store != nil {
+		stored, err := store.GetConversation(ctx, normalizedID)
+		if err != nil {
+			log.Printf("conversation load failed for %s: %v", normalizedID, err)
+		} else {
+			conversation = stored
+		}
 	}
 
 	conversation = append(conversation, openai.ChatCompletionMessage{
@@ -98,42 +152,47 @@ func handleIncomingMessage(ctx context.Context, oa *openai.Client, evo *Evolutio
 		Content: userInput,
 	})
 
-	reply, err := buildChatReply(ctx, oa, conversation)
-	if err != nil {
-		return fmt.Errorf("chat completion: %w", err)
+	modelID := strings.TrimSpace(cfg.OpenAIModel)
+	if modelID == "" {
+		modelID = "gpt-4o-mini"
 	}
 
-	audioData, audioErr := synthesizeAudio(ctx, oa, cfg.OpenAIVoice, reply)
-	if audioErr != nil {
-		log.Printf("audio synthesis failed: %v", audioErr)
-		if err := evo.SendTextMessage(ctx, sender, reply); err != nil {
-			return fmt.Errorf("send text fallback: %w", err)
-		}
-	} else {
-		if err := evo.SendAudioMessage(ctx, sender, audioData); err != nil {
-			log.Printf("send audio failed: %v", err)
-			if err := evo.SendTextMessage(ctx, sender, reply); err != nil {
-				return fmt.Errorf("send text fallback: %w", err)
-			}
-		}
+	resp, err := oa.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+		Model:    modelID,
+		Messages: conversation,
+	})
+	if err != nil {
+		return "", err
 	}
+
+	if len(resp.Choices) == 0 || resp.Choices[0].Message.Content == "" {
+		return "", nil
+	}
+
+	reply := strings.TrimSpace(resp.Choices[0].Message.Content)
+	if reply == "" {
+		return "", nil
+	}
+
 	conversation = append(conversation, openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleAssistant,
 		Content: reply,
 	})
 
-	if err := store.SaveConversation(ctx, sender, conversation); err != nil {
-		log.Printf("conversation save failed for %s: %v", sender, err)
+	if store != nil {
+		if err := store.SaveConversation(ctx, normalizedID, conversation); err != nil {
+			log.Printf("conversation save failed for %s: %v", normalizedID, err)
+		}
 	}
 
-	return nil
+	return reply, nil
 }
 
-func extractMessageBody(msg model.WebhookMessage) string {
+func extractMessageText(msg model.WebhookMessage) string {
 	candidates := []string{
 		msg.Body,
-		msg.Conversation,
 		msg.Text,
+		msg.Conversation,
 		msg.ExtendedText,
 	}
 
@@ -143,141 +202,50 @@ func extractMessageBody(msg model.WebhookMessage) string {
 		}
 	}
 
+	if msg.ExtendedTextMessage != nil {
+		if trimmed := strings.TrimSpace(msg.ExtendedTextMessage.Text); trimmed != "" {
+			return trimmed
+		}
+	}
+
+	if msg.ButtonsResponseMessage != nil {
+		if trimmed := strings.TrimSpace(msg.ButtonsResponseMessage.SelectedDisplayText); trimmed != "" {
+			return trimmed
+		}
+		if trimmed := strings.TrimSpace(msg.ButtonsResponseMessage.SelectedButtonID); trimmed != "" {
+			return trimmed
+		}
+	}
+
+	if msg.InteractiveResponseMessage != nil && msg.InteractiveResponseMessage.Body != nil {
+		if trimmed := strings.TrimSpace(msg.InteractiveResponseMessage.Body.Text); trimmed != "" {
+			return trimmed
+		}
+	}
+
 	return ""
 }
 
-func resolveSender(data model.WebhookData) string {
-	candidates := []string{
-		data.Message.From,
-		data.Sender,
-		data.Message.RemoteJID,
-		data.Message.ChatID,
-		data.Key.RemoteJID,
-		data.RemoteJID,
-		data.ChatID,
-	}
-
-	for _, candidate := range candidates {
-		if normalized := normalizeRemoteID(candidate); normalized != "" {
+func chooseRecipient(values ...string) string {
+	for _, value := range values {
+		if normalized := normalizeWhatsAppID(value); normalized != "" {
 			return normalized
 		}
 	}
-
 	return ""
 }
 
-func normalizeRemoteID(id string) string {
-	trimmed := strings.TrimSpace(id)
-	if trimmed == "" {
+func normalizeWhatsAppID(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
 		return ""
 	}
 
-	if strings.Contains(trimmed, "@") {
-		parts := strings.Split(trimmed, "@")
-		if len(parts) > 0 {
-			return strings.TrimSpace(parts[0])
-		}
+	if idx := strings.IndexByte(id, '@'); idx >= 0 {
+		id = id[:idx]
 	}
+	id = strings.TrimPrefix(id, "+")
+	id = strings.TrimSpace(id)
 
-	return trimmed
-}
-
-func buildChatReply(ctx context.Context, oa *openai.Client, history []openai.ChatCompletionMessage) (string, error) {
-	messages := make([]openai.ChatCompletionMessage, 0, len(history)+1)
-	messages = append(messages, openai.ChatCompletionMessage{
-		Role:    openai.ChatMessageRoleSystem,
-		Content: "Você é um assistente do WhatsApp. Responda de forma breve e amigável.",
-	})
-	messages = append(messages, history...)
-
-	resp, err := oa.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-		Model:    openai.GPT4o,
-		Messages: messages,
-	})
-	if err != nil {
-		return "", err
-	}
-
-	if len(resp.Choices) == 0 {
-		return "", errors.New("chat completion returned no choices")
-	}
-
-	return strings.TrimSpace(resp.Choices[0].Message.Content), nil
-}
-
-func transcribeAudio(ctx context.Context, oa *openai.Client, audioURL string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, audioURL, nil)
-	if err != nil {
-		return "", err
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 300 {
-		return "", fmt.Errorf("download audio: status %s", resp.Status)
-	}
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	audioReq := openai.AudioRequest{
-		Model:    openai.Whisper1,
-		FilePath: "audio.ogg",
-		Reader:   bytes.NewReader(data),
-		Format:   openai.AudioResponseFormatText,
-	}
-
-	transcription, err := oa.CreateTranscription(ctx, audioReq)
-	if err != nil {
-		return "", err
-	}
-
-	return strings.TrimSpace(transcription.Text), nil
-}
-
-func synthesizeAudio(ctx context.Context, oa *openai.Client, voice, text string) ([]byte, error) {
-	req := openai.CreateSpeechRequest{
-		Model:          "gpt-4o-mini-tts",
-		Voice:          mapSpeechVoice(voice),
-		Input:          text,
-		ResponseFormat: openai.SpeechResponseFormatMp3,
-	}
-
-	resp, err := oa.CreateSpeech(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Close()
-
-	audio, err := io.ReadAll(resp)
-	if err != nil {
-		return nil, err
-	}
-
-	return audio, nil
-}
-
-func mapSpeechVoice(voice string) openai.SpeechVoice {
-	switch strings.ToLower(voice) {
-	case "alloy", "":
-		return openai.VoiceAlloy
-	case "echo":
-		return openai.VoiceEcho
-	case "fable":
-		return openai.VoiceFable
-	case "onyx":
-		return openai.VoiceOnyx
-	case "nova":
-		return openai.VoiceNova
-	case "shimmer":
-		return openai.VoiceShimmer
-	default:
-		return openai.VoiceAlloy
-	}
+	return id
 }
